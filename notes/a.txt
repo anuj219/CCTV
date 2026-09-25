@@ -1,0 +1,104 @@
+initial design propt - 
+    Ill feed my family member's images so that it can identify them always
+    whenever family member arrives, if they hasnt been seen from last one minute, then we make their entry, with time, and imp details we can note.
+
+    whenever unknown person comes, we alert, and note the details as well
+    alerts will be sent either on an app, or a web service, or via email/sms
+
+    if we have an app or interface, we will run AI mode, which can be triggered maybe if more than 3 people detected or some other sensible trigger
+    where in pic will be sent to LLM, with given prompt, and that entire pic + llm_output will be sent to interface or sms
+
+    and some other security features we can do using computer vision
+
+
+cmds - 
+    capture known_faces:
+        cctv/ - python cctv.py
+    
+    run enrollment on known_faces:
+        NeytraN/ - python -m cctv.enrollment cctv/known_faces
+
+    run main testing :
+        NetraN/ - python -m cctv.test  
+
+also, we need to take stream , instead of pics
+    like how vlc does
+
+
+why not noSQL for fast RnW-
+    NoSQL (MongoDB, CouchDB, Redis): Every write involves packing a payload (BSON/JSON), making a TCP loopback request to localhost:27017, context-switching between processes, and waiting for an ACK.
+    SQLite: A write is a direct C-level function call (sqlite3_step) that writes straight to local memory or disk. A local write takes less than 0.2 milliseconds.
+    
+
+I think we need to have 8 to 10 photos for each person
+
+Matched enrollment known_faces to go in rotated same as during inference (cv2.ROTATE_90_CLOCKWISE)
+
+
+
+Tried ArcFace + Insight Face Architecture
+    InsightFace: An open-source 2D and 3D deep face analysis toolkit/framework that provides
+        a full suite of tools for computer vision tasks, including detection, alignment, and recognition.
+        Implements Arcface and has Retinaface as a module
+    ArcFace: additive angular margin loss function and embedding method
+        designed specifically for identity recognition and more robust to CCTV pose and lighting
+        creates the 512 dimensional vector using a NN
+        FaceNet uses trplet loss, whereas ArcFace uses Additive Angular Margin Loss
+            designed to make better clusters
+            transforms classic softmax loss into geometric margin based function
+            works in angular space to force larger margin between classes, pushing embeddings apart, based on angle, rather than distance alone
+            it normalizes embeddings and class weights, making classification largely depend on margin
+            thus, small differences in angle make big impact
+        ArcFace does produce clusters of embeddings for each identity, but clustering is not the training objective.
+        it typically does - I already know which identity each image belongs to. just Learn an embedding space where images of the same identity align closely and different identities are separated by an angular margin.
+
+    previosuly, dlib did face encoding from an estimated head crop
+        it assumed top 35–50% is the face and did encoding
+
+    Now
+        Yolo detects person
+        InsightFace's RetinaFace module, detects the actual face
+        facial landmarks align the face
+        ArcFace creates a stronger 512-D identity embedding (instead of dlib's 128D)
+        compare against multiple enrolled embeddings
+        pool embeddings across tracked frames
+            several observations of the same person are averaged, reducing noise from individual frames
+        the result must remain consistent across multiple observations.
+    
+    main change : InsightFace RetinaFace + aligned ArcFace face crop
+
+    new pooling:
+        each tracked person stores up to 5 ArcFace embeddings (track["embeddings"].append(face.embedding))
+        Pooling calculates their average
+        So instead of matching one noisy frame, it matches a representation of the person across several frames
+
+        gallery/db has prototype for each person
+            i.e average embedding + closest individual enrollment embedding
+
+    Flow
+        Gallery/db creation
+            each person's usable image is converted to embedding using retinaFace+Arcface method
+            Also, prototype is create which is the average of all embeddings for a person
+            thus, Anuj:
+                individual embeddings: E1, E2, E3
+                prototype: average(E1, E2, E3)
+
+        Live, 
+        As Anuj moves, the tracker collects live embeddings
+        Yolo detects person (returns bounding box)
+            Only people whose bottom-center lies inside ZONE_POINTS continue to recognition.
+        InsightFace processes the frame
+            uses RetinaFace internally to find actual faces and landmarks (returns face bounding box)
+            InsightFace generates one vector for that face, which has 512 numbers
+            code stores up to five such embedding vectors (track["embeddings"].append(face.embedding))
+            Calculates average of those 5
+        matching
+            pooled live embedding is compared with every enrolled person
+            eg distance to Anuj prototype = 0.22, closest distance to Anuj photo = 0.18
+                distance to Darshana prototype = 0.39, closest distance to Darshana photo = 0.35
+                distance is cosine-style distance
+
+            score = 0.7 * prototype_distance + 0.3 * best_individual_distance
+            result accepted if best_score <= 0.45 and at least 0.05 better than second-best score else result will be 'unknown'
+
+        If Anuj gets 2/3 votes, he will be locked

@@ -1,0 +1,76 @@
+# Smart Doorstep Recognition System — Master Design Spec
+
+## Architecture (high level)
+- CCTV DVR (Ezviz, RTSP enabled) → frames pulled via OpenCV on a PC/Raspberry Pi (the "brain")
+- Brain runs the full recognition + logic pipeline (derived from Neytra's detector/recognizer/enrollment code)
+- Outputs: local log, Telegram alerts, optional ESP32-triggered chime/light
+- ESP32's role is intentionally light — it receives simple triggers over WiFi/HTTP from the brain, it does not run any AI itself
+
+---
+
+## 1. Enrollment (family faces)
+- Multiple reference photos per family member (different angles/lighting), not just one
+- Confidence buffer: borderline matches are flagged as "possibly [name], low confidence" instead of silently accepted or rejected — **[open decision: include in v1, or keep simple known/unknown for now?]**
+
+## 2. Known-family entry logging
+- Log an entry only if that person hasn't been seen in the last 1 minute (cooldown, same pattern as Neytra's encounter tracking)
+- Each log entry captures: name, timestamp, camera/entrance ID, confidence score, saved thumbnail of the frame, count of other people present at the same time
+
+## 3. Unknown-person handling
+- Every unknown-face detection gets logged, no suppression by default
+- Separate alert cooldown (distinct from the logging cooldown) — don't re-alert for the same unknown face more than once every ~2 minutes, to avoid alert spam
+
+## 4. "AI Mode" — LLM-powered scene description
+- Trigger conditions (any one fires it):
+  - 3+ people detected at once
+  - An unknown face lingers beyond ~15 seconds
+  - A person is detected but no face can be extracted (obscured/turned away/covered)
+  - Any detection between 12am–5am, regardless of known or unknown
+- On trigger: capture the frame → send to Gemini with a prompt asking who's there, what they're doing, headcount, and whether anything looks unusual → bundle the LLM's text output + the image together → push through the alert channel
+
+## 5. Alert channel
+- **Primary: Telegram bot** — free, instant, supports photo + text in one push, no app-building required
+- **Optional later: simple local web dashboard** — live log + latest alerts, nice-to-have not required for v1
+- **Skip SMS** unless there's a specific need (e.g. an elder relative without a smartphone) — **[open decision: confirm]**
+- Email as an optional secondary/backup channel, not primary
+
+## 6. Extra CV security features
+- **Face-covered/obscured detection** — person detected (via YOLO) but no face encoding extractable → its own alert category, separate from "unrecognized known-type face"
+- **Tailgating flag** — a recognized family entry immediately followed within a few seconds by an unrecognized person entering right behind them
+- **Odd-hours known-face flag** — folded into the AI Mode trigger above (known face + unusual hour still gets flagged)
+- **Loitering/lingering pattern** — someone stationary at the door for an extended period with no known-family arrival — treat as phase 2, harder to tune well
+
+## 7. Silent hand-gesture doorbell
+- A defined gesture (wave / hold-up-hand) replaces ringing the physical bell
+- Detected via MediaPipe Hands (preferred over raw motion-diffing — more reliable, low extra effort)
+- Gesture detection only runs when a person is already confirmed in frame (avoids false triggers from birds, branches, etc.)
+- On detection: push a **distinct notification tune** (not the generic alert sound) to one specific family member's phone via Telegram
+
+## 8. Zone-restricted recognition
+- Define a trigger zone (polygon) mapped to the actual gate/doorway path, not the whole street view seen by the camera
+- Recognition only runs once a detected person's bounding-box centroid enters that zone (`cv2.pointPolygonTest`)
+- One-time manual calibration — mark the zone coordinates once on a sample frame, doesn't need redoing
+
+## 9. Approach-direction filter
+- Recognition only fires if the person is getting closer to the camera over time, not just present
+- Tracked via bounding-box area across consecutive frames — consistently increasing area = approaching; shrinking/flat = not
+- Solves: you exiting the house, or standing outside briefly, doesn't trigger anything  
+- Known tradeoff: needs a few frames of history first, so there's a small (roughly half-to-one-second) delay before a decision is made — acceptable for a doorbell, not for anything needing instant response
+
+## 10. Pipeline firing order
+1. Person detected anywhere in frame (YOLO)
+2. → Check: has their bbox centroid entered the defined trigger zone?
+3. → Check: is their bbox area consistently increasing (approaching)?
+4. → Only if both pass: run face recognition, then downstream logic (family cooldown log / unknown alert / AI Mode trigger)
+- Gesture detection runs independently of steps 2–3, any time a person is in frame
+
+---
+
+## Still open — need your call before/while building
+- [ ] Confidence-buffer for family matches: v1 or later?
+- [ ] SMS or email as a secondary channel, or Telegram-only?
+- [ ] Log storage: assuming simple local CSV/SQLite is enough unless you want something else
+
+
+
+In case of unknown person, visitor entry to be made, with short AI description (blinkit guy, courier guy, police etc)
