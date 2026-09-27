@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from insightface.app import FaceAnalysis
 from ultralytics import YOLO
 
+from cctv.db import create_entry_event, init_db, should_log_entry, update_entry_event
 from cctv.rtsp_stream import RTSPStream
 
 load_dotenv()
@@ -33,13 +34,18 @@ VOTE_WINDOW_SIZE = 3
 MINIMUM_VOTES = 2
 EMBEDDINGS_PER_TRACK = 5
 RECOGNITION_INTERVAL = 3
+RECHECK_INTERVAL_SECONDS = 10.0
+RECOGNITION_RETRY_SECONDS = 1.0
+START_LINE_Y = 1000
+DOOR_LINE_Y = 1900
+ENTRY_COOLDOWN_SECONDS = 60.0
 TRACK_MAX_MISSED_FRAMES = 30
 ROTATION = cv2.ROTATE_90_CLOCKWISE
 MODEL_PATH = os.path.join("models", "yolo11n.pt")
 KNOWN_FACES_PATH = os.path.join("cctv", "known_faces")
 GALLERY_PATH = os.path.join("cctv", "arcface_gallery.pkl")
 ZONE_POINTS = np.array(
-    [[100, 1000], [800, 700], [800, 2100], [100, 2100]],
+    [[100, 1100], [800, 600], [800, 2000], [100, 2000]],
     np.int32,
 )
 
@@ -168,11 +174,122 @@ def match_embedding(embedding, gallery):
 
 def draw_detection(frame, bbox, label, color):
     x1, y1, x2, y2 = bbox
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-    cv2.putText(frame, label, (x1, max(25, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+    cv2.putText(
+        frame,
+        label,
+        (x1, max(40, y1 - 12)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.0,
+        color,
+        3,
+        cv2.LINE_AA,
+    )
+
+
+def update_entry_state(track, person_box):
+    _, _, _, y2 = person_box
+    current_foot_y = y2
+    previous_foot_y = track["previous_foot_y"]
+    track["previous_foot_y"] = current_foot_y
+
+    if previous_foot_y is None:
+        return
+
+    crossed_start = previous_foot_y < START_LINE_Y <= current_foot_y
+    crossed_door = previous_foot_y < DOOR_LINE_Y <= current_foot_y
+    crossed_both = previous_foot_y < START_LINE_Y and current_foot_y >= DOOR_LINE_Y
+
+    if crossed_start:
+        track["has_approached"] = True
+        print(
+            f"[CROSSING] START line crossed: foot_y "
+            f"{previous_foot_y}->{current_foot_y}"
+        )
+
+    if crossed_door and track["has_approached"] or crossed_both:
+        track["entry_pending"] = True
+        track["entry_crossed_at"] = time.monotonic()
+        print(
+            f"[CROSSING] DOOR line crossed: foot_y "
+            f"{previous_foot_y}->{current_foot_y}"
+        )
+
+
+def emit_entry_if_ready(track, now, headcount):
+    if not track["entry_pending"]:
+        return
+
+    if track["locked"]:
+        person_name = track["name"]
+        allowed = should_log_entry(person_name, ENTRY_COOLDOWN_SECONDS, track["entry_event_id"])
+        status = "known" if allowed else "known_suppressed"
+        if track["entry_event_id"] is None:
+            track["entry_event_id"] = create_entry_event(
+                status,
+                headcount,
+                track["track_id"],
+            )
+        update_entry_event(
+            track["entry_event_id"],
+            status,
+            person_name,
+            track["score"],
+        )
+        if not allowed:
+            print(
+                f"[ENTRY] Suppressed {person_name}: "
+                f"database cooldown active ({ENTRY_COOLDOWN_SECONDS:.0f}s)"
+            )
+        else:
+            if track["entry_status"] == "unconfirmed_unknown":
+                print(f"[ENTRY UPDATE] Previously unconfirmed entry resolved as {person_name}")
+            else:
+                print(f"[ENTRY] {person_name} crossed the doorway")
+        track["entry_status"] = status
+        track["entry_pending"] = False
+        return
+
+    if track["unknown_confirmed"]:
+        if track["entry_event_id"] is None:
+            track["entry_event_id"] = create_entry_event(
+                "confirmed_unknown",
+                headcount,
+                track["track_id"],
+            )
+        update_entry_event(
+            track["entry_event_id"],
+            "confirmed_unknown",
+            "Unknown",
+        )
+        if track["entry_status"] == "unconfirmed_unknown":
+            print("[ENTRY UPDATE] Previously unconfirmed entry confirmed as unknown visitor")
+        else:
+            print("[ENTRY] Confirmed unknown visitor crossed the doorway")
+        track["entry_status"] = "confirmed_unknown"
+        track["entry_pending"] = False
+        return
+
+    if track["entry_status"] is None:
+        track["entry_event_id"] = create_entry_event(
+            "unconfirmed_unknown",
+            headcount,
+            track["track_id"],
+        )
+        track["entry_status"] = "unconfirmed_unknown"
+        print("[ENTRY] Unconfirmed unknown visitor crossed the doorway")
+
+
+def recognition_is_due(track, frame_number, now):
+    if now - track["last_attempt_at"] < RECOGNITION_RETRY_SECONDS:
+        return False
+    if not track["locked"]:
+        return frame_number - track["last_recognition"] >= RECOGNITION_INTERVAL
+    return now - track["last_confirmed_at"] >= RECHECK_INTERVAL_SECONDS
 
 
 def main():
+    init_db()
     print("[ARCFACE] Loading buffalo_l model; first run may download model files...")
     face_app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
     face_app.prepare(ctx_id=0, det_size=FACE_DETECTION_SIZE)
@@ -186,6 +303,7 @@ def main():
     capture = cv2.VideoCapture(source) if stream is None else None
     tracks = []
     frame_number = 0
+    next_track_id = 1
     try:
         cv2.namedWindow("Neytra CCTV ArcFace Test", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Neytra CCTV ArcFace Test", 900, 700)
@@ -197,7 +315,6 @@ def main():
             frame = cv2.rotate(frame, ROTATION)
             frame_number += 1
             annotated = frame.copy()
-            faces = [face for face in face_app.get(frame) if is_good_face(face)]
             person_boxes = []
             results = yolo(frame, classes=[0], verbose=False)
             for box in results[0].boxes if results and results[0].boxes is not None else []:
@@ -214,27 +331,102 @@ def main():
                 if track is None:
                     track = {"bbox": person_box, "name": "Recognizing...", "score": None,
                              "votes": deque(maxlen=VOTE_WINDOW_SIZE), "embeddings": deque(maxlen=EMBEDDINGS_PER_TRACK),
-                             "locked": False, "last_seen": frame_number, "last_recognition": -RECOGNITION_INTERVAL}
+                             "locked": False, "last_seen": frame_number,
+                             "last_recognition": -RECOGNITION_INTERVAL,
+                             "last_attempt_at": 0.0, "last_confirmed_at": None,
+                             "previous_foot_y": None, "has_approached": False,
+                             "entry_pending": False, "entry_status": None,
+                             "entry_crossed_at": None, "unknown_votes": deque(maxlen=VOTE_WINDOW_SIZE),
+                             "unknown_confirmed": False, "entry_event_id": None,
+                             "track_id": f"track-{next_track_id}"}
+                    next_track_id += 1
                     tracks.append(track)
                 else:
                     track["bbox"] = person_box
                     track["last_seen"] = frame_number
+                update_entry_state(track, person_box)
 
-                if frame_number - track["last_recognition"] >= RECOGNITION_INTERVAL:
-                    face = face_for_person(faces, person_box)
-                    if face is not None:
-                        track["embeddings"].append(normalize_embedding(face.embedding))
+            now = time.monotonic()
+            due_tracks = [
+                track for track in tracks
+                if track["last_seen"] == frame_number
+                and recognition_is_due(track, frame_number, now)
+            ]
+            faces = []
+            if due_tracks:
+                face_started_at = time.perf_counter()
+                faces = [face for face in face_app.get(frame) if is_good_face(face)]
+                face_elapsed_ms = (time.perf_counter() - face_started_at) * 1000
+                print(
+                    f"[TIMING] ArcFace={face_elapsed_ms:.0f}ms "
+                    f"tracks={len(due_tracks)}"
+                )
+
+            for track in due_tracks:
+                person_box = track["bbox"]
+                track["last_attempt_at"] = now
+                track["last_recognition"] = frame_number
+                face = face_for_person(faces, person_box)
+                if face is not None:
+                    current_embedding = normalize_embedding(face.embedding)
+                    if track["locked"]:
+                        pooled_embedding = current_embedding
+                    else:
+                        track["embeddings"].append(current_embedding)
                         pooled_embedding = normalize_embedding(np.mean(track["embeddings"], axis=0))
-                        candidate_name, candidate_score = match_embedding(pooled_embedding, gallery)
-                        if not track["locked"] and candidate_name != "Unknown":
-                            track["votes"].append(candidate_name)
-                            voted_name, vote_count = Counter(track["votes"]).most_common(1)[0]
-                            if vote_count >= MINIMUM_VOTES:
-                                track["name"] = voted_name
-                                track["score"] = candidate_score
-                                track["locked"] = True
-                                print(f"[ARCFACE ANNOUNCE] {voted_name} locked after {vote_count}/{VOTE_WINDOW_SIZE} votes")
-                    track["last_recognition"] = frame_number
+
+                    candidate_name, candidate_score = match_embedding(pooled_embedding, gallery)
+                    if track["locked"]:
+                        if candidate_name == track["name"]:
+                            track["score"] = candidate_score
+                            track["last_confirmed_at"] = now
+                        else:
+                            print(
+                                f"[ARCFACE] Recheck failed for {track['name']}; "
+                                "unlocking track"
+                            )
+                            track["locked"] = False
+                            track["name"] = "Recognizing..."
+                            track["score"] = None
+                            track["votes"].clear()
+                            track["embeddings"].clear()
+                            track["unknown_votes"].clear()
+                            track["unknown_confirmed"] = False
+                    elif candidate_name != "Unknown":
+                        track["unknown_votes"].clear()
+                        track["unknown_confirmed"] = False
+                        track["votes"].append(candidate_name)
+                        voted_name, vote_count = Counter(track["votes"]).most_common(1)[0]
+                        if vote_count >= MINIMUM_VOTES:
+                            track["name"] = voted_name
+                            track["score"] = candidate_score
+                            track["locked"] = True
+                            track["last_confirmed_at"] = now
+                            print(
+                                f"[ARCFACE ANNOUNCE] {voted_name} locked "
+                                f"after {vote_count}/{VOTE_WINDOW_SIZE} votes"
+                            )
+                    elif candidate_score is not None:
+                        track["votes"].clear()
+                        track["unknown_votes"].append(True)
+                        if (
+                            not track["unknown_confirmed"]
+                            and sum(track["unknown_votes"]) >= MINIMUM_VOTES
+                        ):
+                            track["unknown_confirmed"] = True
+                            print(
+                                "[ARCFACE] Visitor confirmed unknown "
+                                f"after {sum(track['unknown_votes'])}/{VOTE_WINDOW_SIZE} samples"
+                            )
+
+                emit_entry_if_ready(track, now, len(person_boxes))
+
+            for person_box in person_boxes:
+                track = find_track(person_box, tracks)
+                if track is None:
+                    continue
+
+                emit_entry_if_ready(track, now, len(person_boxes))
 
                 label = track["name"]
                 if label == "Recognizing..." and track["votes"]:
@@ -245,7 +437,51 @@ def main():
 
             tracks[:] = [track for track in tracks if frame_number - track["last_seen"] <= TRACK_MAX_MISSED_FRAMES]
             cv2.polylines(annotated, [ZONE_POINTS], True, (255, 0, 255), 2)
-            cv2.putText(annotated, f"People in zone: {len(person_boxes)} | q/Esc to quit", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            frame_width = annotated.shape[1]
+            cv2.line(
+                annotated,
+                (0, START_LINE_Y),
+                (frame_width, START_LINE_Y),
+                (0, 255, 255),
+                3,
+            )
+            cv2.line(
+                annotated,
+                (0, DOOR_LINE_Y),
+                (frame_width, DOOR_LINE_Y),
+                (0, 0, 255),
+                3,
+            )
+            cv2.putText(
+                annotated,
+                "START",
+                (20, START_LINE_Y - 15),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (0, 255, 255),
+                3,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                annotated,
+                "DOOR",
+                (20, DOOR_LINE_Y - 15),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (0, 0, 255),
+                3,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                annotated,
+                f"People in zone: {len(person_boxes)} | q/Esc to quit",
+                (20, 55),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.1,
+                (255, 255, 255),
+                3,
+                cv2.LINE_AA,
+            )
             cv2.imshow("Neytra CCTV ArcFace Test", cv2.resize(annotated, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA))
             if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
                 break

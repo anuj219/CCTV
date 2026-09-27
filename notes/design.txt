@@ -51,6 +51,7 @@
 - Recognition only runs once a detected person's bounding-box centroid enters that zone (`cv2.pointPolygonTest`)
 - One-time manual calibration — mark the zone coordinates once on a sample frame, doesn't need redoing
 
+
 ## 9. Approach-direction filter
 - Recognition only fires if the person is getting closer to the camera over time, not just present
 - Tracked via bounding-box area across consecutive frames — consistently increasing area = approaching; shrinking/flat = not
@@ -74,3 +75,20 @@
 
 
 In case of unknown person, visitor entry to be made, with short AI description (blinkit guy, courier guy, police etc)
+Entry and exit logging of family members.
+End of day, all actions will be taken and AI summarizer wil give summary of what happened over all in a day. 
+
+------------------------------------------done till now:
+
+- ArcFace-based face recognition is working in `cctv/test2.py`, 
+  with a separate gallery, per-track embedding pooling, identity voting, and periodic rechecks.
+- Person entry is detected by bottom-center tracking across two visible virtual lines in the rotated CCTV frame: crossing START arms the track; crossing DOOR from outside to inside creates an entry event. 
+  A fast movement crossing both lines in one frame is also handled.
+- If identity is not resolved at the doorway, an `unconfirmed_unknown` entry is recorded immediately. 
+  The same database row is updated if ArcFace later confirms a family member or confirms the visitor is unknown.
+- Confirmed known entries are subject to a persistent 60-second cooldown per person. 
+  Cooldown-suppressed events are retained with status `known_suppressed`.
+- SQLite entry events are stored in `cctv/cctv_logs.db`, in the `entry_events` table. 
+  Current fields include event time/type, person name, status, confidence, simultaneous headcount, camera ID, track ID, image path, and create/update times.
+- Snapshot capture and AI scene description are not implemented yet. They are intended to run after an unknown entry becomes `confirmed_unknown`.
+- Entry/exit logging is currently entry-only; exit direction detection and end-of-day summarization remain future work.
