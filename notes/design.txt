@@ -90,5 +90,6 @@ End of day, all actions will be taken and AI summarizer wil give summary of what
   Cooldown-suppressed events are retained with status `known_suppressed`.
 - SQLite entry events are stored in `cctv/cctv_logs.db`, in the `entry_events` table. 
   Current fields include event time/type, person name, status, confidence, simultaneous headcount, camera ID, track ID, image path, and create/update times.
-- Snapshot capture and AI scene description are not implemented yet. They are intended to run after an unknown entry becomes `confirmed_unknown`.
-- Entry/exit logging is currently entry-only; exit direction detection and end-of-day summarization remain future work.
+- Entry/exit logging is currently entry-only; exit direction detection and end-of-day summarization remain future work. 
+
+- AI scene summaries run for unresolved/unknown visitors lingering in the door zone for 15 seconds, with a 60-second summary cooldown. The live provider is Groq vision (`qwen/qwen3.8-27b`), verified using `cctv/ai_test.py`; snapshot storage and alert delivery remain future work.

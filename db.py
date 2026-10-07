@@ -35,6 +35,30 @@ def init_db():
                 updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ai_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER NOT NULL,
+                summary_text TEXT NOT NULL,
+                reason TEXT,
+                headcount INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (event_id) REFERENCES entry_events(id)
+            )
+        """)
+        summary_columns = {
+            row[1] for row in cursor.execute("PRAGMA table_info(ai_summaries)")
+        }
+        for column_name, column_definition in (
+            ("reason", "TEXT"),
+            ("headcount", "INTEGER NOT NULL DEFAULT 0"),
+            ("error", "TEXT"),
+        ):
+            if column_name not in summary_columns:
+                cursor.execute(
+                    f"ALTER TABLE ai_summaries ADD COLUMN {column_name} {column_definition}"
+                )
         conn.commit()
 
 
@@ -76,6 +100,31 @@ def should_log_entry(person_name, cooldown_seconds=60, exclude_event_id=None):
         params.append(exclude_event_id)
     with closing(sqlite3.connect(DB_FILE)) as conn:
         return conn.execute(query, params).fetchone() is None
+
+
+def create_ai_summary(event_id, summary_text, reason=None, headcount=0, error=None):
+    """Persist a scene summary tied to a valid entry event."""
+    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
+        cursor = conn.cursor()
+        columns = {row[1] for row in cursor.execute("PRAGMA table_info(ai_summaries)")}
+        values = {
+            "event_id": event_id,
+            "summary_text": summary_text,
+            "reason": reason,
+            "headcount": headcount,
+            "error": error,
+            "trigger_reason": reason,
+        }
+        insert_columns = [name for name in values if name in columns]
+        placeholders = ", ".join("?" for _ in insert_columns)
+        column_list = ", ".join(insert_columns)
+        cursor.execute(
+            f"INSERT INTO ai_summaries ({column_list}) VALUES ({placeholders})",
+            [values[name] for name in insert_columns],
+        )
+        conn.commit()
+        return cursor.lastrowid
+
 
 def should_log_encounter(person_name, cooldown_seconds=60):
     """Returns True if the person hasn't been logged in the last cooldown period."""

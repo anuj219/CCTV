@@ -21,12 +21,22 @@ class RTSPStream:
 
     def _update(self):
         while self.running:
-            ret, frame = self.cap.read()
+            try:
+                ret, frame = self.cap.read()
+            except cv2.error:
+                if not self.running:
+                    break
+                print("[RTSP] Capture read failed / reconnecting...")
+                ret, frame = False, None
             if not ret:
                 if not self.running:
                     break
                 print("[RTSP] Frame drop / reconnecting...")
-                self.cap.open(self.rtsp_url)
+                try:
+                    self.cap.open(self.rtsp_url)
+                except cv2.error:
+                    if not self.running:
+                        break
                 continue
             with self.lock:
                 self.frame = frame

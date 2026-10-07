@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from insightface.app import FaceAnalysis
 from ultralytics import YOLO
 
+from cctv.ai_summary import generate_scene_summary, should_generate_summary
 from cctv.db import create_entry_event, init_db, should_log_entry, update_entry_event
 from cctv.rtsp_stream import RTSPStream
 
@@ -39,6 +40,7 @@ RECOGNITION_RETRY_SECONDS = 1.0
 START_LINE_Y = 1000
 DOOR_LINE_Y = 1900
 ENTRY_COOLDOWN_SECONDS = 60.0
+UNKNOWN_LINGER_SECONDS = 15.0
 TRACK_MAX_MISSED_FRAMES = 30
 ROTATION = cv2.ROTATE_90_CLOCKWISE
 MODEL_PATH = os.path.join("models", "yolo11n.pt")
@@ -216,7 +218,63 @@ def update_entry_state(track, person_box):
         )
 
 
-def emit_entry_if_ready(track, now, headcount):
+def update_unknown_linger_state(track, now, headcount, frame=None):
+    if not track.get("has_approached", False):
+        track["unknown_linger_started_at"] = None
+        return
+
+    if track.get("locked", False):
+        track["unknown_linger_started_at"] = None
+        return
+
+    is_unknown = (
+        track.get("unknown_confirmed")
+        or track.get("entry_status") in {"unconfirmed_unknown", "confirmed_unknown"}
+        or track.get("name") == "Recognizing..."
+    )
+
+    if not is_unknown:
+        track["unknown_linger_started_at"] = None
+        return
+
+    if track.get("unknown_linger_started_at") is None:
+        track["unknown_linger_started_at"] = now
+        print(
+            f"[AI SUMMARY] Unknown / no-face visitor in door zone; "
+            f"linger timer started at {now:.1f}s"
+        )
+        return
+
+    if (now - float(track["unknown_linger_started_at"])) < UNKNOWN_LINGER_SECONDS:
+        return
+
+    if track.get("entry_event_id") is None:
+        track["entry_event_id"] = create_entry_event(
+            "confirmed_unknown",
+            headcount,
+            track["track_id"],
+        )
+    update_entry_event(
+        track["entry_event_id"],
+        "confirmed_unknown",
+        "Unknown",
+    )
+    track["entry_status"] = "confirmed_unknown"
+    track["unknown_confirmed"] = True
+
+    if should_generate_summary(track, now):
+        summary = generate_scene_summary(
+            track["entry_event_id"],
+            frame=frame,
+            headcount=headcount,
+            reason="unknown_linger",
+        )
+        track["last_ai_summary_at"] = now
+        if summary:
+            print(f"[AI SUMMARY] {summary}")
+
+
+def emit_entry_if_ready(track, now, headcount, frame=None):
     if not track["entry_pending"]:
         return
 
@@ -266,6 +324,16 @@ def emit_entry_if_ready(track, now, headcount):
             print("[ENTRY UPDATE] Previously unconfirmed entry confirmed as unknown visitor")
         else:
             print("[ENTRY] Confirmed unknown visitor crossed the doorway")
+        if should_generate_summary(track, now):
+            summary = generate_scene_summary(
+                track["entry_event_id"],
+                frame=frame,
+                headcount=headcount,
+                reason="unknown_entry",
+            )
+            track["last_ai_summary_at"] = now
+            if summary:
+                print(f"[AI SUMMARY] {summary}")
         track["entry_status"] = "confirmed_unknown"
         track["entry_pending"] = False
         return
@@ -278,6 +346,16 @@ def emit_entry_if_ready(track, now, headcount):
         )
         track["entry_status"] = "unconfirmed_unknown"
         print("[ENTRY] Unconfirmed unknown visitor crossed the doorway")
+        if should_generate_summary(track, now):
+            summary = generate_scene_summary(
+                track["entry_event_id"],
+                frame=frame,
+                headcount=headcount,
+                reason="no_face",
+            )
+            track["last_ai_summary_at"] = now
+            if summary:
+                print(f"[AI SUMMARY] {summary}")
 
 
 def recognition_is_due(track, frame_number, now):
@@ -338,12 +416,14 @@ def main():
                              "entry_pending": False, "entry_status": None,
                              "entry_crossed_at": None, "unknown_votes": deque(maxlen=VOTE_WINDOW_SIZE),
                              "unknown_confirmed": False, "entry_event_id": None,
-                             "track_id": f"track-{next_track_id}"}
+                             "unknown_linger_started_at": None, "last_ai_summary_at": 0.0,
+                             "last_frame": frame.copy(), "track_id": f"track-{next_track_id}"}
                     next_track_id += 1
                     tracks.append(track)
                 else:
                     track["bbox"] = person_box
                     track["last_seen"] = frame_number
+                track["last_frame"] = frame.copy()
                 update_entry_state(track, person_box)
 
             now = time.monotonic()
@@ -419,14 +499,15 @@ def main():
                                 f"after {sum(track['unknown_votes'])}/{VOTE_WINDOW_SIZE} samples"
                             )
 
-                emit_entry_if_ready(track, now, len(person_boxes))
+                update_unknown_linger_state(track, now, len(person_boxes), frame)
+                emit_entry_if_ready(track, now, len(person_boxes), frame)
 
             for person_box in person_boxes:
                 track = find_track(person_box, tracks)
                 if track is None:
                     continue
 
-                emit_entry_if_ready(track, now, len(person_boxes))
+                emit_entry_if_ready(track, now, len(person_boxes), frame)
 
                 label = track["name"]
                 if label == "Recognizing..." and track["votes"]:
